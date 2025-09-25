@@ -117,29 +117,39 @@ def compute_gradient_norm(model):
 
 
 def compute_model_tflops(batch_size, seq_len, config, time_elapsed, is_training=True):
-    """Compute TFLOPS for the model"""
-    # Basic transformer FLOPS calculation
-    # Attention: 4 * batch * seq_len^2 * hidden_dim (QKV projection + attention)
-    # FFN: 2 * batch * seq_len * hidden_dim * ffn_dim
-    # For MoE: multiply FFN by (num_experts_per_token / num_experts)
+    """Compute TFLOPS for the model - corrected calculation"""
+    # Reference: https://arxiv.org/pdf/2104.04473.pdf (Efficient Large-Scale Language Model Training)
+    # For each transformer layer:
+    # - Attention: 2 * batch * seq_len * seq_len * hidden_dim (for QKV projections)
+    # - Attention computation: 2 * batch * num_heads * seq_len * seq_len * (hidden_dim/num_heads)
+    # - FFN: 8 * batch * seq_len * hidden_dim * ffn_dim (two linear layers)
 
-    # Attention FLOPS
-    attention_flops = 4 * batch_size * seq_len * seq_len * config.hidden_dim
+    # Simplified calculation for transformer blocks
+    # Attention block (including QKV, attention, output projection)
+    attn_flops_per_layer = 2 * batch_size * seq_len * (3 * config.hidden_dim * config.hidden_dim +  # QKV
+                                                        2 * seq_len * config.hidden_dim +  # Attention
+                                                        config.hidden_dim * config.hidden_dim)  # Output proj
 
-    # MoE FFN FLOPS (only active experts)
-    active_expert_ratio = config.num_experts_per_token / config.num_experts
-    ffn_flops = 2 * batch_size * seq_len * config.hidden_dim * config.expert_hidden_dim
-    moe_flops = ffn_flops * active_expert_ratio
+    # MoE FFN (only active experts count)
+    # For SwiGLU: 3 matrices (gate, up, down) so it's 3x the standard FFN
+    active_experts = config.num_experts_per_token
+    ffn_flops_per_layer = 3 * 2 * batch_size * seq_len * config.hidden_dim * config.expert_hidden_dim * active_experts
 
-    # Total FLOPS per forward pass
-    total_flops = (attention_flops + moe_flops) * config.num_layers
+    # Gate computation for routing
+    gate_flops_per_layer = 2 * batch_size * seq_len * config.hidden_dim * config.num_experts
 
-    # Training has forward + backward (3x forward cost)
+    # Total per layer
+    flops_per_layer = attn_flops_per_layer + ffn_flops_per_layer + gate_flops_per_layer
+
+    # Total for all layers
+    total_flops = flops_per_layer * config.num_layers
+
+    # Training multiplier (forward + backward + gradient computation)
     if is_training:
         total_flops *= 3
 
-    # Convert to TFLOPS
-    tflops = (total_flops / time_elapsed) / 1e12
+    # Convert to TFLOPS/s
+    tflops = total_flops / (time_elapsed * 1e12)
 
     return tflops
 
@@ -378,14 +388,17 @@ def main():
         # Calculate theoretical peak TFLOPS for the GPU
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name()
-            # Rough estimates for common GPUs (BF16/FP16 TFLOPS)
+            # Correct peak TFLOPS for common GPUs (FP16/BF16 with Tensor Cores)
             gpu_peak_tflops = {
-                'A100': 312,  # A100 80GB
-                'A6000': 155,  # RTX A6000
-                'V100': 125,  # V100
-                'RTX 4090': 165,  # RTX 4090
-                'RTX 3090': 71,   # RTX 3090
-                'H100': 989,  # H100
+                'A100': 312,      # A100 80GB
+                'A6000': 155,     # RTX A6000
+                'V100': 125,      # V100
+                '4090': 82.6,     # RTX 4090 (82.58 TFLOPS FP16)
+                '4080': 48.7,     # RTX 4080
+                '3090': 35.6,     # RTX 3090 (35.58 TFLOPS FP16)
+                'H100': 989,      # H100
+                'A40': 149.7,     # A40
+                'L40': 90.5,      # L40
             }
 
             peak_tflops = 100  # Default estimate
@@ -476,17 +489,27 @@ def main():
             avg_grad_norm = np.mean(grad_norm_window) if grad_norm_window else grad_norm
             perplexity = np.exp(min(avg_loss, 20))  # Cap to avoid overflow
 
-            # Calculate TFLOPS
-            avg_step_time = np.mean(step_times) if step_times else step_time
-            tflops = compute_model_tflops(
-                batch_size=args.batch_size * args.gradient_accumulation_steps,
-                seq_len=args.max_length,
-                config=model_config,
-                time_elapsed=avg_step_time,
-                is_training=True
-            )
-            tflops_window.append(tflops)
-            avg_tflops = np.mean(tflops_window) if tflops_window else tflops
+            # Calculate TFLOPS (using actual step time, not per-sample time)
+            # Note: step_time is for single batch, but we accumulate gradients
+            # So effective computation is batch_size * gradient_accumulation_steps
+            effective_batch = args.batch_size * args.gradient_accumulation_steps
+
+            # Use the average time per gradient accumulation cycle
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 and step_times:
+                # Time for full gradient accumulation cycle
+                cycle_time = sum(list(step_times)[-args.gradient_accumulation_steps:])
+
+                tflops = compute_model_tflops(
+                    batch_size=effective_batch,
+                    seq_len=args.max_length,
+                    config=model_config,
+                    time_elapsed=cycle_time,
+                    is_training=True
+                )
+                tflops_window.append(tflops)
+                avg_tflops = np.mean(tflops_window) if tflops_window else tflops
+            else:
+                avg_tflops = np.mean(tflops_window) if tflops_window else 0
 
             # Calculate tokens/sec
             current_time = time.time()
@@ -532,7 +555,19 @@ def main():
                     # Performance metrics
                     print(f"\nPerformance:")
                     print(f"  Tokens/sec (recent): {recent_tokens_per_sec:.0f} | Tokens/sec (avg): {tokens_per_sec:.0f}")
-                    print(f"  TFLOPS: {avg_tflops:.2f} | Step time: {avg_step_time*1000:.1f}ms")
+                    if avg_tflops > 0:
+                        print(f"  TFLOPS: {avg_tflops:.2f} | Step time: {avg_step_time*1000:.1f}ms")
+                        # Show GPU utilization if we know peak TFLOPS
+                        if torch.cuda.is_available():
+                            gpu_name = torch.cuda.get_device_name()
+                            for gpu_key in ['4090', '3090', 'A100', 'V100', 'H100', 'A40', 'L40', '4080']:
+                                if gpu_key in gpu_name:
+                                    peak = gpu_peak_tflops.get(gpu_key, 100)
+                                    utilization = (avg_tflops / peak) * 100
+                                    print(f"  GPU Compute Utilization: {utilization:.1f}% of peak {peak:.1f} TFLOPS")
+                                    break
+                    else:
+                        print(f"  Step time: {avg_step_time*1000:.1f}ms")
                     print(f"  Total Tokens Processed: {tokens_processed:,}")
 
                     # Memory metrics

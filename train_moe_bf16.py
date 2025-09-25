@@ -15,11 +15,52 @@ import json
 from datetime import datetime, timedelta
 import numpy as np
 from collections import deque
+import wandb
 
 from tutel import system, net
 from tutel import moe as tutel_moe
 from moe_model import ExperimentalMoEModel, MoEConfig
 from dataset import OptimizedDataLoader
+
+
+def setup_wandb(args, model_config, parallel_env):
+    """Initialize W&B with comprehensive MoE tracking"""
+    if parallel_env.global_rank == 0:  # Only rank 0 logs to W&B
+        wandb.init(
+            project="moe-training",
+            name=f"moe_{args.num_experts}e_{args.num_experts_per_token}t_{args.precision}",
+            config={
+                # Model config
+                "model": {
+                    "hidden_dim": model_config.hidden_dim,
+                    "num_layers": model_config.num_layers,
+                    "num_heads": model_config.num_heads,
+                    "num_experts": model_config.num_experts,
+                    "num_experts_per_token": model_config.num_experts_per_token,
+                    "vocab_size": model_config.vocab_size,
+                    "intermediate_dim": model_config.intermediate_dim,
+                    "num_kv_heads": model_config.num_kv_heads,
+                },
+                # Training config
+                "training": {
+                    "batch_size": args.batch_size,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                    "learning_rate": args.learning_rate,
+                    "weight_decay": args.weight_decay,
+                    "warmup_steps": args.warmup_steps,
+                    "max_steps": args.max_steps,
+                    "precision": args.precision,
+                },
+                # Hardware
+                "hardware": {
+                    "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU",
+                    "num_gpus": torch.cuda.device_count(),
+                }
+            },
+            tags=[f"moe-{args.num_experts}", args.precision, "tutel"],
+        )
+        return True
+    return False
 
 
 def setup_distributed():
@@ -83,12 +124,13 @@ def create_optimizer(model, args):
         {'params': expert_params, 'lr': args.learning_rate * args.expert_lr_scale}
     ]
 
-    # AdamW optimizer with weight decay
+    # AdamW optimizer with weight decay and fused kernels for better performance
     optimizer = optim.AdamW(
         param_groups,
         betas=(0.9, 0.95),
         eps=1e-8,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        fused=torch.cuda.is_available()  # Use fused optimizer on GPU for better performance
     )
 
     return optimizer
@@ -174,8 +216,36 @@ def get_gpu_memory_info():
     }
 
 
+def extract_moe_metrics(model):
+    """Extract MoE-specific metrics for monitoring"""
+    metrics = {}
+
+    # Find MoE layers and extract routing statistics
+    for i, layer in enumerate(model.layers):
+        if hasattr(layer, 'ffn') and hasattr(layer.ffn, '_moe_layer'):
+            moe_layer = layer.ffn._moe_layer
+
+            # Get routing statistics if available
+            if hasattr(moe_layer, 'get_balance_loss'):
+                # Tutel exposes balance loss which indicates expert utilization
+                balance_loss = moe_layer.get_balance_loss()
+                if balance_loss is not None:
+                    metrics[f'layer_{i}/balance_loss'] = balance_loss.item()
+
+            # Try to get gate statistics
+            if hasattr(moe_layer, 'gates') or hasattr(moe_layer, 'gate'):
+                gate = getattr(moe_layer, 'gates', getattr(moe_layer, 'gate', None))
+                if gate is not None and hasattr(gate, 'weight'):
+                    # Gate weight statistics
+                    gate_weights = gate.weight.data
+                    metrics[f'layer_{i}/gate_weight_mean'] = gate_weights.mean().item()
+                    metrics[f'layer_{i}/gate_weight_std'] = gate_weights.std().item()
+
+    return metrics
+
+
 def train_step(model, batch, optimizer, scaler, parallel_env, args):
-    """Single training step with mixed precision"""
+    """Single training step with mixed precision and MoE metrics"""
     model.train()
     step_start_time = time.time()
 
@@ -206,6 +276,9 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
         aux_loss = outputs['aux_loss']
         loss = loss / args.gradient_accumulation_steps
 
+    # Extract MoE metrics before backward pass
+    moe_metrics = extract_moe_metrics(model)
+
     # Backward pass
     if args.precision == 'fp16':
         # FP16 requires GradScaler
@@ -225,7 +298,7 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
 
     step_time = time.time() - step_start_time
 
-    return loss.item() * args.gradient_accumulation_steps, aux_loss.item(), grad_norm, step_time
+    return loss.item() * args.gradient_accumulation_steps, aux_loss.item(), grad_norm, step_time, moe_metrics
 
 
 @torch.no_grad()
@@ -289,6 +362,8 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./checkpoints', help='Output directory')
     parser.add_argument('--resume_from', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--profile', action='store_true', help='Enable PyTorch profiler')
+    parser.add_argument('--use_wandb', action='store_true', default=True, help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='moe-training', help='W&B project name')
 
     args = parser.parse_args()
 
@@ -346,6 +421,11 @@ def main():
     # Create optimizer
     optimizer = create_optimizer(model, args)
 
+    # Initialize W&B if enabled
+    is_main_rank = parallel_env.global_rank == 0
+    if args.use_wandb and is_main_rank:
+        setup_wandb(args, config, parallel_env)
+
     # Create learning rate scheduler
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -388,17 +468,17 @@ def main():
         # Calculate theoretical peak TFLOPS for the GPU
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name()
-            # Correct peak TFLOPS for common GPUs (FP16/BF16 with Tensor Cores)
+            # Peak TFLOPS for BF16/FP16 Tensor Cores (not FP32!)
             gpu_peak_tflops = {
-                'A100': 312,      # A100 80GB
-                'A6000': 155,     # RTX A6000
-                'V100': 125,      # V100
-                '4090': 82.6,     # RTX 4090 (82.58 TFLOPS FP16)
-                '4080': 48.7,     # RTX 4080
-                '3090': 35.6,     # RTX 3090 (35.58 TFLOPS FP16)
-                'H100': 989,      # H100
-                'A40': 149.7,     # A40
-                'L40': 90.5,      # L40
+                'A100': 312,      # A100 80GB - BF16 tensor cores
+                'A6000': 155,     # RTX A6000 - FP16 tensor cores
+                'V100': 125,      # V100 - FP16 tensor cores
+                '4090': 330,      # RTX 4090 - ~330 TFLOPS BF16 tensor cores (not 82.6 FP32!)
+                '4080': 195,      # RTX 4080 - ~195 TFLOPS BF16 tensor cores
+                '3090': 142,      # RTX 3090 - FP16 tensor cores (no BF16 support)
+                'H100': 989,      # H100 80GB - BF16 tensor cores
+                'A40': 150,       # A40 - FP16 tensor cores
+                'L40': 362,       # L40 - FP16 tensor cores
             }
 
             peak_tflops = 100  # Default estimate
@@ -450,7 +530,7 @@ def main():
             break
 
         # Training step
-        loss, aux_loss, grad_norm, step_time = train_step(
+        loss, aux_loss, grad_norm, step_time, moe_metrics = train_step(
             model, batch, optimizer, scaler, parallel_env, args
         )
 
@@ -530,69 +610,57 @@ def main():
                 # Get memory info
                 mem_info = get_gpu_memory_info()
 
+                # Simple progress bar (minimal terminal output)
                 pbar_dict = {
                     'loss': f'{avg_loss:.4f}',
                     'ppl': f'{perplexity:.2f}',
-                    'tflops': f'{avg_tflops:.2f}',
-                    'tok/s': f'{tokens_per_sec:.0f}',
-                    'mem%': f"{mem_info.get('efficiency_percent', 0):.0f}%",
                 }
                 pbar.set_postfix(pbar_dict)
                 pbar.update(1)
 
-                # Periodic detailed logging
-                if global_step % 50 == 0:  # Log every 50 steps
-                    time_since_last_log = current_time - last_log_time
-                    recent_tokens_per_sec = (args.batch_size * args.gradient_accumulation_steps *
-                                           args.max_length * 50) / time_since_last_log
+                # Log to W&B instead of terminal
+                if args.use_wandb and global_step % 10 == 0:  # Log to W&B every 10 steps
+                    wandb_metrics = {
+                        # Core metrics
+                        'train/loss': avg_loss,
+                        'train/perplexity': perplexity,
+                        'train/aux_loss': avg_aux_loss,
+                        'train/grad_norm': avg_grad_norm,
+                        'train/learning_rate': scheduler.get_last_lr()[0],
 
-                    # Calculate average step time
-                    avg_step_time = np.mean(step_times) if step_times else 0.1
+                        # Performance metrics
+                        'performance/tokens_per_sec': tokens_per_sec,
+                        'performance/tflops': avg_tflops,
+                        'performance/step_time_ms': np.mean(step_times) * 1000 if step_times else 0,
+                        'performance/tokens_processed': tokens_processed,
 
-                    print(f"\n" + "="*70)
-                    print(f"Step {global_step}/{args.max_steps} - Detailed Metrics:")
-                    print(f"  Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")
-                    print(f"  Gradient Norm: {avg_grad_norm:.3f} | Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
-                    print(f"  Aux Loss: {avg_aux_loss:.4f}")
+                        # GPU metrics
+                        'gpu/memory_allocated_gb': mem_info['allocated_gb'],
+                        'gpu/memory_reserved_gb': mem_info['reserved_gb'],
+                        'gpu/memory_efficiency': mem_info['efficiency_percent'],
+                    }
 
-                    # Performance metrics
-                    print(f"\nPerformance:")
-                    print(f"  Tokens/sec (recent): {recent_tokens_per_sec:.0f} | Tokens/sec (avg): {tokens_per_sec:.0f}")
-                    if avg_tflops > 0:
-                        print(f"  TFLOPS: {avg_tflops:.2f} | Step time: {avg_step_time*1000:.1f}ms")
-                        # Show GPU utilization if we know peak TFLOPS
-                        if torch.cuda.is_available():
-                            gpu_name = torch.cuda.get_device_name()
-                            for gpu_key in ['4090', '3090', 'A100', 'V100', 'H100', 'A40', 'L40', '4080']:
-                                if gpu_key in gpu_name:
-                                    peak = gpu_peak_tflops.get(gpu_key, 100)
-                                    utilization = (avg_tflops / peak) * 100
-                                    print(f"  GPU Compute Utilization: {utilization:.1f}% of peak {peak:.1f} TFLOPS")
-                                    break
-                    else:
-                        print(f"  Step time: {avg_step_time*1000:.1f}ms")
-                    print(f"  Total Tokens Processed: {tokens_processed:,}")
+                    # Add MoE-specific metrics
+                    for key, value in moe_metrics.items():
+                        wandb_metrics[f'moe/{key}'] = value
 
-                    # Memory metrics
-                    if torch.cuda.is_available():
-                        mem_info = get_gpu_memory_info()
-                        print(f"\nGPU Memory:")
-                        print(f"  Allocated: {mem_info['allocated_gb']:.2f}GB | Reserved: {mem_info['reserved_gb']:.2f}GB")
-                        print(f"  Peak Allocated: {mem_info['max_allocated_gb']:.2f}GB")
-                        print(f"  Memory Efficiency: {mem_info['efficiency_percent']:.1f}%")
+                    # Calculate GPU utilization if possible
+                    if torch.cuda.is_available() and avg_tflops > 0:
+                        gpu_name = torch.cuda.get_device_name()
+                        for gpu_key in ['4090', '3090', 'A100', 'V100', 'H100', 'A40', 'L40', '4080']:
+                            if gpu_key in gpu_name:
+                                peak = gpu_peak_tflops.get(gpu_key, 100)
+                                utilization = (avg_tflops / peak) * 100
+                                wandb_metrics['gpu/compute_utilization'] = utilization
+                                wandb_metrics['gpu/peak_tflops'] = peak
+                                break
 
-                        # Model efficiency estimate
-                        # Theoretical minimum memory for model params + optimizer states
-                        model_params_gb = sum(p.numel() for p in model.parameters()) * 4 / 1024**3  # FP32 params
-                        optimizer_states_gb = model_params_gb * 2  # Adam has 2 states
-                        theoretical_min = model_params_gb + optimizer_states_gb
-                        print(f"  Theoretical Min (params+opt): {theoretical_min:.2f}GB")
-                        print(f"  Actual vs Theoretical: {mem_info['allocated_gb']/theoretical_min:.2f}x")
+                    wandb.log(wandb_metrics, step=global_step)
 
-                    print(f"\nProgress:")
-                    print(f"  Time Elapsed: {str(timedelta(seconds=int(elapsed_time)))} | ETA: {eta_str}")
-                    print("="*70)
-
+                # Minimal terminal logging (only every 100 steps)
+                if global_step % 100 == 0:
+                    # Minimal console output
+                    print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | Tokens/s: {tokens_per_sec:.0f} | TFLOPS: {avg_tflops:.1f}")
                     last_log_time = current_time
 
     pbar.close()
@@ -614,6 +682,10 @@ def main():
             print(f"Final perplexity: {final_ppl:.2f}")
 
         print("="*70)
+
+        # Finish W&B run
+        if args.use_wandb:
+            wandb.finish()
 
 
 if __name__ == "__main__":

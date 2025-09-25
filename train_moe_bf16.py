@@ -12,7 +12,9 @@ import argparse
 from tqdm import tqdm
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import numpy as np
+from collections import deque
 
 from tutel import system, net
 from moe_model import ExperimentalMoEModel, MoEConfig
@@ -102,9 +104,21 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def compute_gradient_norm(model):
+    """Compute total gradient norm across all parameters"""
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    return total_norm
+
+
 def train_step(model, batch, optimizer, scaler, parallel_env, args):
     """Single training step with mixed precision"""
     model.train()
+    step_start_time = time.time()
 
     # Move batch to device
     input_ids = batch['input_ids']
@@ -147,7 +161,12 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
             if not hasattr(param, 'skip_allreduce') and param.grad is not None:
                 param.grad = net.simple_all_reduce(param.grad) / parallel_env.global_size
 
-    return loss.item() * args.gradient_accumulation_steps, aux_loss.item()
+    # Compute gradient norm before clipping (for monitoring)
+    grad_norm = compute_gradient_norm(model)
+
+    step_time = time.time() - step_start_time
+
+    return loss.item() * args.gradient_accumulation_steps, aux_loss.item(), grad_norm, step_time
 
 
 @torch.no_grad()
@@ -205,6 +224,7 @@ def main():
     # Data arguments
     parser.add_argument('--dataset_name', type=str, default='HuggingFaceFW/fineweb-edu', help='Dataset name')
     parser.add_argument('--num_workers', type=int, default=None, help='DataLoader workers')
+    parser.add_argument('--log_interval', type=int, default=50, help='Steps between detailed logs')
 
     # System arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints', help='Output directory')
@@ -305,21 +325,34 @@ def main():
         print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
         print("="*60 + "\n")
 
+    # Initialize metrics tracking
+    loss_window = deque(maxlen=100)
+    aux_loss_window = deque(maxlen=100)
+    grad_norm_window = deque(maxlen=100)
+    tokens_processed = 0
+    training_start_time = time.time()
+    last_log_time = time.time()
+
     # Training loop
     model.train()
     optimizer.zero_grad()
     global_step = 0
 
-    pbar = tqdm(total=args.max_steps, desc="Training", disable=(parallel_env.global_rank != 0))
+    pbar = tqdm(total=args.max_steps, desc="Training", disable=(parallel_env.global_rank != 0), unit="step")
 
     for batch_idx, batch in enumerate(dataloader):
         if global_step >= args.max_steps:
             break
 
         # Training step
-        loss, aux_loss = train_step(
+        loss, aux_loss, grad_norm, step_time = train_step(
             model, batch, optimizer, scaler, parallel_env, args
         )
+
+        # Update metrics
+        loss_window.append(loss)
+        aux_loss_window.append(aux_loss)
+        grad_norm_window.append(grad_norm)
 
         # Gradient accumulation
         if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -337,20 +370,85 @@ def main():
             optimizer.zero_grad()
             global_step += 1
 
-            # Update progress bar
+            # Update token count
+            tokens_processed += args.batch_size * args.gradient_accumulation_steps * args.max_length
+
+            # Calculate metrics
+            avg_loss = np.mean(loss_window) if loss_window else loss
+            avg_aux_loss = np.mean(aux_loss_window) if aux_loss_window else aux_loss
+            avg_grad_norm = np.mean(grad_norm_window) if grad_norm_window else grad_norm
+            perplexity = np.exp(min(avg_loss, 20))  # Cap to avoid overflow
+
+            # Calculate tokens/sec
+            current_time = time.time()
+            elapsed_time = current_time - training_start_time
+            tokens_per_sec = tokens_processed / elapsed_time if elapsed_time > 0 else 0
+
+            # Calculate ETA
+            steps_remaining = args.max_steps - global_step
+            if global_step > 0:
+                time_per_step = elapsed_time / global_step
+                eta_seconds = time_per_step * steps_remaining
+                eta_str = str(timedelta(seconds=int(eta_seconds)))
+            else:
+                eta_str = "--:--:--"
+
+            # Update progress bar with comprehensive metrics
             if parallel_env.global_rank == 0:
                 pbar.set_postfix({
-                    'loss': f'{loss:.4f}',
-                    'aux': f'{aux_loss:.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                    'loss': f'{avg_loss:.4f}',
+                    'ppl': f'{perplexity:.2f}',
+                    'grad': f'{avg_grad_norm:.3f}',
+                    'aux': f'{avg_aux_loss:.3f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+                    'tok/s': f'{tokens_per_sec:.0f}',
+                    'eta': eta_str
                 })
                 pbar.update(1)
+
+                # Periodic detailed logging
+                if global_step % 50 == 0:  # Log every 50 steps
+                    time_since_last_log = current_time - last_log_time
+                    recent_tokens_per_sec = (args.batch_size * args.gradient_accumulation_steps *
+                                           args.max_length * 50) / time_since_last_log
+
+                    print(f"\n" + "="*70)
+                    print(f"Step {global_step}/{args.max_steps} - Detailed Metrics:")
+                    print(f"  Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")
+                    print(f"  Gradient Norm: {avg_grad_norm:.3f} | Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+                    print(f"  Aux Loss: {avg_aux_loss:.4f}")
+                    print(f"  Tokens/sec (recent): {recent_tokens_per_sec:.0f} | Tokens/sec (avg): {tokens_per_sec:.0f}")
+                    print(f"  Total Tokens Processed: {tokens_processed:,}")
+
+                    if torch.cuda.is_available():
+                        allocated_gb = torch.cuda.memory_allocated() / 1024**3
+                        reserved_gb = torch.cuda.memory_reserved() / 1024**3
+                        print(f"  GPU Memory: {allocated_gb:.2f}GB allocated / {reserved_gb:.2f}GB reserved")
+
+                    print(f"  Time Elapsed: {str(timedelta(seconds=int(elapsed_time)))} | ETA: {eta_str}")
+                    print("="*70)
+
+                    last_log_time = current_time
 
     pbar.close()
 
     if parallel_env.global_rank == 0:
-        print("\nTraining completed!")
+        total_time = time.time() - training_start_time
+        print("\n" + "="*70)
+        print("TRAINING COMPLETED")
+        print("="*70)
         print(f"Final step: {global_step}")
+        print(f"Total time: {str(timedelta(seconds=int(total_time)))}")
+        print(f"Total tokens processed: {tokens_processed:,}")
+        print(f"Average tokens/sec: {tokens_processed/total_time:.0f}")
+
+        if loss_window:
+            final_loss = np.mean(list(loss_window)[-10:])  # Last 10 losses
+            final_ppl = np.exp(min(final_loss, 20))
+            print(f"Final loss (last 10 steps): {final_loss:.4f}")
+            print(f"Final perplexity: {final_ppl:.2f}")
+
+        print("="*70)
 
 
 if __name__ == "__main__":

@@ -202,18 +202,11 @@ class OptimizedDataLoader:
             'drop_last': True,  # Consistent batch sizes for training
         }
 
-        # DataLoader optimizations (no pin_memory to avoid CUDA issues)
-        if self.has_cuda:
-            dataloader_kwargs['pin_memory'] = False  # Disabled to avoid CUDA errors
-            if self.num_workers > 0:
-                dataloader_kwargs['prefetch_factor'] = prefetch_factor
-                dataloader_kwargs['persistent_workers'] = persistent_workers
-        else:
-            # CPU mode
-            dataloader_kwargs['pin_memory'] = False
-            if self.num_workers > 0:
-                dataloader_kwargs['prefetch_factor'] = prefetch_factor
-                dataloader_kwargs['persistent_workers'] = False  # Save memory on CPU
+        # Simplified DataLoader optimizations (no pin_memory)
+        if self.num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = prefetch_factor
+            # Keep workers alive only on GPU for better performance
+            dataloader_kwargs['persistent_workers'] = persistent_workers and self.has_cuda
 
         self.dataloader = DataLoader(self.dataset, **dataloader_kwargs)
 

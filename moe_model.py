@@ -315,31 +315,24 @@ class SwiGLUExpert(nn.Module):
         """Forward pass for SwiGLU expert with token tracking"""
         # --- Track tokens actually processed per expert ----------------------
         if _MOE_INSPECTOR.enabled:
-            # Debug: Print ctx attributes on first call
+            # Get layer index for tracking
             layer_idx = getattr(self, 'layer_idx', 0)
-            if layer_idx == 0 and not hasattr(self, '_debug_printed'):
-                self._debug_printed = True
-                print(f"\n[DEBUG] Tutel ctx attributes: {list(vars(ctx).keys())}")
-                for attr in vars(ctx):
-                    val = getattr(ctx, attr)
-                    if torch.is_tensor(val):
-                        print(f"  {attr}: tensor with shape {val.shape}, dtype {val.dtype}")
-                    else:
-                        print(f"  {attr}: {type(val).__name__} = {val}")
 
-            # Prefer ctx-provided counts if available (names vary by Tutel version)
+            # Use Tutel's dispatch_count field (confirmed via debug output)
             counts = None
+            if hasattr(ctx, 'dispatch_count'):
+                dispatch_count = ctx.dispatch_count
+                if torch.is_tensor(dispatch_count):
+                    counts = dispatch_count.to(torch.long)
+
+            # Also grab auxiliary loss if available
+            aux_loss_value = None
+            if hasattr(ctx, 'l_aux'):
+                aux_loss_value = ctx.l_aux
+
+            # Get capacity info if available
             cap = getattr(ctx, 'expert_capacity', None)
             drop = getattr(ctx, 'dropped_per_expert', None)
-
-            # Check more possible field names
-            for candidate in ('tokens_per_expert', 'exp_counts', 'expert_tokens', 'counts',
-                            'expert_count', 'indices', 'locations', 'bins'):
-                if hasattr(ctx, candidate):
-                    val = getattr(ctx, candidate)
-                    if torch.is_tensor(val):
-                        counts = val
-                        break
 
             if counts is None:
                 # Fallback: count non-padding tokens

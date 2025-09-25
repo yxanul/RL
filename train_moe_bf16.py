@@ -546,6 +546,9 @@ def main():
                     recent_tokens_per_sec = (args.batch_size * args.gradient_accumulation_steps *
                                            args.max_length * 50) / time_since_last_log
 
+                    # Calculate average step time
+                    avg_step_time = np.mean(step_times) if step_times else 0.1
+
                     print(f"\n" + "="*70)
                     print(f"Step {global_step}/{args.max_steps} - Detailed Metrics:")
                     print(f"  Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")

@@ -17,7 +17,7 @@ import logging
 class MoEConfig:
     """Configuration for our experimental MoE model"""
     # Model dimensions
-    vocab_size: int = 50257  # GPT-2 tokenizer size
+    vocab_size: int = 32768  # Mistral-7B-Instruct-v0.3 tokenizer size
     hidden_dim: int = 768   # Model dimension (reduced for <1B params)
     num_layers: int = 12    # Number of transformer layers
 
@@ -478,7 +478,7 @@ class ExperimentalMoEModel(nn.Module):
             input_ids = torch.cat([input_ids, next_token], dim=-1)
 
             # Stop if EOS token
-            if next_token.item() == 50256:  # GPT-2 EOS token
+            if next_token.item() == 2:  # Mistral EOS token
                 break
 
         return input_ids

@@ -18,7 +18,7 @@ class StreamingTextDataset(IterableDataset):
         self,
         dataset_name: str = "HuggingFaceFW/fineweb-edu",
         dataset_config: str = "default",
-        tokenizer_name: str = "mistralai/Mistral-7B-v0.1",  # or your preferred tokenizer
+        tokenizer_name: str = "mistralai/Mistral-7B-Instruct-v0.3",  # Vocab size: 32768
         max_length: int = 2048,
         buffer_size: int = 10000,  # Buffer for shuffling
         seed: int = 42

@@ -34,8 +34,16 @@ class StreamingTextDataset(IterableDataset):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # We'll initialize the dataset in __iter__ to ensure it's done in the worker process
-        self._dataset = None
+        # CRITICAL FIX: Initialize dataset ONCE here, not in __iter__
+        # This prevents rate limit errors from multiple workers making API calls
+        print(f"Initializing dataset {dataset_name} (one-time initialization)...")
+        self._base_dataset = load_dataset(
+            self.dataset_name,
+            self.dataset_config,
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+        )
     
     def __iter__(self) -> Iterator[dict]:
         # Get worker info for proper sharding in multi-worker setup
@@ -49,29 +57,28 @@ class StreamingTextDataset(IterableDataset):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
         
-        # Initialize streaming dataset with sharding for this worker
-        dataset = load_dataset(
-            self.dataset_name,
-            self.dataset_config,
-            split="train",
-            streaming=True,
-        )
-        
-        # Shard the dataset across workers to avoid duplicate data
-        dataset = dataset.shuffle(seed=self.seed + worker_id, buffer_size=self.buffer_size)
-        
-        # Skip to this worker's portion
-        dataset_iter = iter(dataset)
-        for _ in range(worker_id):
-            next(dataset_iter, None)
+        # FIXED: Use the pre-initialized dataset instead of creating new ones
+        # This avoids hitting HuggingFace rate limits (1000 requests/5min)
+        if num_workers > 1:
+            # For multiple workers, use skip for efficient sharding
+            dataset_shard = self._base_dataset.skip(worker_id)
+        else:
+            dataset_shard = self._base_dataset
+
+        # Shuffle with worker-specific seed
+        dataset_shard = dataset_shard.shuffle(seed=self.seed + worker_id, buffer_size=self.buffer_size)
+        dataset_iter = iter(dataset_shard)
         
         # Process items with stride equal to number of workers
         token_buffer = []
-        
-        for idx, item in enumerate(dataset_iter):
+        items_processed = 0
+
+        for item in dataset_iter:
             # Only process every num_workers-th item for this worker
-            if idx % num_workers != worker_id:
+            if num_workers > 1 and items_processed % num_workers != 0:
+                items_processed += 1
                 continue
+            items_processed += 1
             
             # Extract text (adjust field name based on your dataset)
             text = item.get('text', '') or item.get('content', '')

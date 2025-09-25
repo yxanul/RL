@@ -34,12 +34,12 @@ def setup_wandb(args, model_config, parallel_env):
                 "model": {
                     "hidden_dim": model_config.hidden_dim,
                     "num_layers": model_config.num_layers,
-                    "num_heads": model_config.num_heads,
+                    "num_attention_heads": model_config.num_attention_heads,
                     "num_experts": model_config.num_experts,
                     "num_experts_per_token": model_config.num_experts_per_token,
                     "vocab_size": model_config.vocab_size,
-                    "intermediate_dim": model_config.intermediate_dim,
-                    "num_kv_heads": model_config.num_kv_heads,
+                    "expert_hidden_dim": model_config.expert_hidden_dim,
+                    "num_key_value_heads": model_config.num_key_value_heads,
                 },
                 # Training config
                 "training": {
@@ -344,7 +344,7 @@ def main():
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size per GPU')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Gradient accumulation steps')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
     parser.add_argument('--expert_lr_scale', type=float, default=1.0, help='LR scale for expert parameters')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='Warmup steps')

@@ -17,6 +17,7 @@ import numpy as np
 from collections import deque
 
 from tutel import system, net
+from tutel import moe as tutel_moe
 from moe_model import ExperimentalMoEModel, MoEConfig
 from dataset import OptimizedDataLoader
 
@@ -113,6 +114,54 @@ def compute_gradient_norm(model):
             total_norm += param_norm.item() ** 2
     total_norm = total_norm ** 0.5
     return total_norm
+
+
+def compute_model_tflops(batch_size, seq_len, config, time_elapsed, is_training=True):
+    """Compute TFLOPS for the model"""
+    # Basic transformer FLOPS calculation
+    # Attention: 4 * batch * seq_len^2 * hidden_dim (QKV projection + attention)
+    # FFN: 2 * batch * seq_len * hidden_dim * ffn_dim
+    # For MoE: multiply FFN by (num_experts_per_token / num_experts)
+
+    # Attention FLOPS
+    attention_flops = 4 * batch_size * seq_len * seq_len * config.hidden_dim
+
+    # MoE FFN FLOPS (only active experts)
+    active_expert_ratio = config.num_experts_per_token / config.num_experts
+    ffn_flops = 2 * batch_size * seq_len * config.hidden_dim * config.expert_hidden_dim
+    moe_flops = ffn_flops * active_expert_ratio
+
+    # Total FLOPS per forward pass
+    total_flops = (attention_flops + moe_flops) * config.num_layers
+
+    # Training has forward + backward (3x forward cost)
+    if is_training:
+        total_flops *= 3
+
+    # Convert to TFLOPS
+    tflops = (total_flops / time_elapsed) / 1e12
+
+    return tflops
+
+
+def get_gpu_memory_info():
+    """Get detailed GPU memory information"""
+    if not torch.cuda.is_available():
+        return {}
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+
+    # Memory efficiency ratio
+    efficiency = (allocated / reserved * 100) if reserved > 0 else 0
+
+    return {
+        'allocated_gb': allocated,
+        'reserved_gb': reserved,
+        'max_allocated_gb': max_allocated,
+        'efficiency_percent': efficiency
+    }
 
 
 def train_step(model, batch, optimizer, scaler, parallel_env, args):
@@ -229,6 +278,7 @@ def main():
     # System arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints', help='Output directory')
     parser.add_argument('--resume_from', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--profile', action='store_true', help='Enable PyTorch profiler')
 
     args = parser.parse_args()
 
@@ -322,16 +372,58 @@ def main():
         print("="*60)
         print(f"Precision: {args.precision.upper()}")
         print(f"Device: {device}")
-        print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Total parameters: {total_params / 1e6:.2f}M")
+
+        # Calculate theoretical peak TFLOPS for the GPU
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name()
+            # Rough estimates for common GPUs (BF16/FP16 TFLOPS)
+            gpu_peak_tflops = {
+                'A100': 312,  # A100 80GB
+                'A6000': 155,  # RTX A6000
+                'V100': 125,  # V100
+                'RTX 4090': 165,  # RTX 4090
+                'RTX 3090': 71,   # RTX 3090
+                'H100': 989,  # H100
+            }
+
+            peak_tflops = 100  # Default estimate
+            for gpu_key, tflops_val in gpu_peak_tflops.items():
+                if gpu_key in gpu_name:
+                    peak_tflops = tflops_val
+                    break
+
+            print(f"GPU: {gpu_name}")
+            print(f"Theoretical Peak TFLOPS: ~{peak_tflops}")
+
         print("="*60 + "\n")
 
     # Initialize metrics tracking
     loss_window = deque(maxlen=100)
     aux_loss_window = deque(maxlen=100)
     grad_norm_window = deque(maxlen=100)
+    tflops_window = deque(maxlen=50)
     tokens_processed = 0
     training_start_time = time.time()
     last_log_time = time.time()
+    step_times = deque(maxlen=100)
+
+    # Model configuration for TFLOPS calculation
+    model_config = config
+
+    # Optional profiling
+    profiler = None
+    if args.profile and torch.cuda.is_available() and parallel_env.global_rank == 0:
+        print("PyTorch Profiler enabled - will profile steps 100-110")
+        profiler = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=99, warmup=1, active=10, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(args.output_dir, 'profiler')),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        profiler.start()
 
     # Training loop
     model.train()
@@ -353,6 +445,7 @@ def main():
         loss_window.append(loss)
         aux_loss_window.append(aux_loss)
         grad_norm_window.append(grad_norm)
+        step_times.append(step_time)
 
         # Gradient accumulation
         if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -370,6 +463,10 @@ def main():
             optimizer.zero_grad()
             global_step += 1
 
+            # Step profiler if enabled
+            if profiler is not None:
+                profiler.step()
+
             # Update token count
             tokens_processed += args.batch_size * args.gradient_accumulation_steps * args.max_length
 
@@ -378,6 +475,18 @@ def main():
             avg_aux_loss = np.mean(aux_loss_window) if aux_loss_window else aux_loss
             avg_grad_norm = np.mean(grad_norm_window) if grad_norm_window else grad_norm
             perplexity = np.exp(min(avg_loss, 20))  # Cap to avoid overflow
+
+            # Calculate TFLOPS
+            avg_step_time = np.mean(step_times) if step_times else step_time
+            tflops = compute_model_tflops(
+                batch_size=args.batch_size * args.gradient_accumulation_steps,
+                seq_len=args.max_length,
+                config=model_config,
+                time_elapsed=avg_step_time,
+                is_training=True
+            )
+            tflops_window.append(tflops)
+            avg_tflops = np.mean(tflops_window) if tflops_window else tflops
 
             # Calculate tokens/sec
             current_time = time.time()
@@ -395,15 +504,17 @@ def main():
 
             # Update progress bar with comprehensive metrics
             if parallel_env.global_rank == 0:
-                pbar.set_postfix({
+                # Get memory info
+                mem_info = get_gpu_memory_info()
+
+                pbar_dict = {
                     'loss': f'{avg_loss:.4f}',
                     'ppl': f'{perplexity:.2f}',
-                    'grad': f'{avg_grad_norm:.3f}',
-                    'aux': f'{avg_aux_loss:.3f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+                    'tflops': f'{avg_tflops:.2f}',
                     'tok/s': f'{tokens_per_sec:.0f}',
-                    'eta': eta_str
-                })
+                    'mem%': f"{mem_info.get('efficiency_percent', 0):.0f}%",
+                }
+                pbar.set_postfix(pbar_dict)
                 pbar.update(1)
 
                 # Periodic detailed logging
@@ -417,14 +528,30 @@ def main():
                     print(f"  Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")
                     print(f"  Gradient Norm: {avg_grad_norm:.3f} | Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
                     print(f"  Aux Loss: {avg_aux_loss:.4f}")
+
+                    # Performance metrics
+                    print(f"\nPerformance:")
                     print(f"  Tokens/sec (recent): {recent_tokens_per_sec:.0f} | Tokens/sec (avg): {tokens_per_sec:.0f}")
+                    print(f"  TFLOPS: {avg_tflops:.2f} | Step time: {avg_step_time*1000:.1f}ms")
                     print(f"  Total Tokens Processed: {tokens_processed:,}")
 
+                    # Memory metrics
                     if torch.cuda.is_available():
-                        allocated_gb = torch.cuda.memory_allocated() / 1024**3
-                        reserved_gb = torch.cuda.memory_reserved() / 1024**3
-                        print(f"  GPU Memory: {allocated_gb:.2f}GB allocated / {reserved_gb:.2f}GB reserved")
+                        mem_info = get_gpu_memory_info()
+                        print(f"\nGPU Memory:")
+                        print(f"  Allocated: {mem_info['allocated_gb']:.2f}GB | Reserved: {mem_info['reserved_gb']:.2f}GB")
+                        print(f"  Peak Allocated: {mem_info['max_allocated_gb']:.2f}GB")
+                        print(f"  Memory Efficiency: {mem_info['efficiency_percent']:.1f}%")
 
+                        # Model efficiency estimate
+                        # Theoretical minimum memory for model params + optimizer states
+                        model_params_gb = sum(p.numel() for p in model.parameters()) * 4 / 1024**3  # FP32 params
+                        optimizer_states_gb = model_params_gb * 2  # Adam has 2 states
+                        theoretical_min = model_params_gb + optimizer_states_gb
+                        print(f"  Theoretical Min (params+opt): {theoretical_min:.2f}GB")
+                        print(f"  Actual vs Theoretical: {mem_info['allocated_gb']/theoretical_min:.2f}x")
+
+                    print(f"\nProgress:")
                     print(f"  Time Elapsed: {str(timedelta(seconds=int(elapsed_time)))} | ETA: {eta_str}")
                     print("="*70)
 

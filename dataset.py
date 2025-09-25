@@ -123,11 +123,11 @@ def collate_fn(batch):
     batch_size = len(batch)
     max_length = batch[0]['input_ids'].shape[0]
     
-    # Pre-allocate tensors with pinned memory only if CUDA is available
-    has_cuda = torch.cuda.is_available()
-    input_ids = torch.zeros((batch_size, max_length), dtype=torch.long, pin_memory=has_cuda)
-    labels = torch.zeros((batch_size, max_length), dtype=torch.long, pin_memory=has_cuda)
-    attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long, pin_memory=has_cuda)
+    # Pre-allocate tensors (NO pin_memory here - DataLoader handles that)
+    # Workers should only create regular CPU tensors
+    input_ids = torch.zeros((batch_size, max_length), dtype=torch.long)
+    labels = torch.zeros((batch_size, max_length), dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long)
     
     # Fill tensors
     for i, item in enumerate(batch):
@@ -202,14 +202,14 @@ class OptimizedDataLoader:
             'drop_last': True,  # Consistent batch sizes for training
         }
 
-        # GPU optimizations
+        # DataLoader optimizations (no pin_memory to avoid CUDA issues)
         if self.has_cuda:
-            dataloader_kwargs['pin_memory'] = True  # Fast CPU→GPU transfer
+            dataloader_kwargs['pin_memory'] = False  # Disabled to avoid CUDA errors
             if self.num_workers > 0:
                 dataloader_kwargs['prefetch_factor'] = prefetch_factor
                 dataloader_kwargs['persistent_workers'] = persistent_workers
         else:
-            # CPU mode: disable GPU-specific optimizations
+            # CPU mode
             dataloader_kwargs['pin_memory'] = False
             if self.num_workers > 0:
                 dataloader_kwargs['prefetch_factor'] = prefetch_factor
@@ -230,7 +230,7 @@ class OptimizedDataLoader:
         print(f"Device: {self.device}")
         print(f"CPU Count: {self.cpu_count}")
         print(f"Workers: {self.num_workers}")
-        print(f"Pin Memory: {self.has_cuda}")
+        print(f"Pin Memory: False (disabled for stability)")
         print(f"Force CPU: {self.force_cpu}")
         print("="*60 + "\n")
     

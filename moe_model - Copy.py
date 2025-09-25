@@ -13,60 +13,6 @@ from tutel import moe as tutel_moe
 from tutel import system
 import logging
 
-# --- MoE Inspector (module-level) -------------------------------------------
-class _MoEInspector:
-    """Tracks per-expert token routing statistics across all layers"""
-    def __init__(self):
-        self.enabled = False
-        self.num_layers = None
-        self.num_experts = None
-        self._per_layer = None  # list of dicts
-
-    def init_if_needed(self, num_layers, num_experts):
-        if self.num_layers != num_layers or self.num_experts != num_experts or self._per_layer is None:
-            self.num_layers, self.num_experts = num_layers, num_experts
-            self._per_layer = [
-                {
-                    "tokens": torch.zeros(num_experts, dtype=torch.long),
-                    "capacity": torch.zeros(num_experts, dtype=torch.long),
-                    "dropped": torch.zeros(num_experts, dtype=torch.long),
-                }
-                for _ in range(num_layers)
-            ]
-
-    def enable(self, flag: bool):
-        self.enabled = bool(flag)
-
-    @torch.no_grad()
-    def record(self, layer_idx: int, counts: torch.Tensor, capacity: torch.Tensor = None, dropped: torch.Tensor = None):
-        if not self.enabled or self._per_layer is None:
-            return
-        d = self._per_layer[layer_idx]
-        d["tokens"][:counts.numel()] += counts.cpu()
-        if capacity is not None:
-            d["capacity"][:capacity.numel()] += capacity.cpu()
-        if dropped is not None:
-            d["dropped"][:dropped.numel()] += dropped.cpu()
-
-    def drain(self, reset=True):
-        payload = self._per_layer
-        if reset and payload is not None:
-            self._per_layer = [
-                {k: v.clone().zero_() for k, v in layer.items()}
-                for layer in payload
-            ]
-        return payload
-
-_MOE_INSPECTOR = _MoEInspector()
-
-def moe_stats_enable(flag: bool):
-    """Enable or disable MoE statistics collection"""
-    _MOE_INSPECTOR.enable(flag)
-
-def moe_stats_drain(reset=True):
-    """Get collected statistics and optionally reset"""
-    return _MOE_INSPECTOR.drain(reset)
-
 # Model Configuration
 class MoEConfig:
     """Configuration for our experimental MoE model"""
@@ -277,7 +223,7 @@ class GroupedQueryAttention(nn.Module):
 
 
 class SwiGLUExpert(nn.Module):
-    """Custom SwiGLU expert for Tutel MoE with token tracking"""
+    """Custom SwiGLU expert for Tutel MoE"""
     def __init__(self, **custom_options):
         super().__init__()
         # Parse custom options from Tutel
@@ -286,8 +232,6 @@ class SwiGLUExpert(nn.Module):
                 setattr(self, key, custom_options[key])
             elif key == 'hidden_size_per_expert':
                 self.hidden_dim = custom_options[key]
-            elif key == 'layer_idx':
-                self.layer_idx = int(custom_options[key])
             else:
                 # Log but don't fail on unknown options
                 pass
@@ -312,30 +256,7 @@ class SwiGLUExpert(nn.Module):
             nn.init.normal_(self.W_down, mean=0.0, std=0.02)
 
     def forward(self, x, ctx):
-        """Forward pass for SwiGLU expert with token tracking"""
-        # --- Track tokens actually processed per expert ----------------------
-        if _MOE_INSPECTOR.enabled:
-            # Prefer ctx-provided counts if available (names vary by Tutel version)
-            counts = None
-            cap = getattr(ctx, 'expert_capacity', None)
-            drop = getattr(ctx, 'dropped_per_expert', None)
-
-            for candidate in ('tokens_per_expert', 'exp_counts', 'expert_tokens', 'counts'):
-                if hasattr(ctx, candidate):
-                    val = getattr(ctx, candidate)
-                    if torch.is_tensor(val):
-                        counts = val
-                        break
-
-            if counts is None:
-                # Fallback: treat all-zero rows as padding
-                # x: [E, T, D] -> valid token if any nonzero across D
-                valid = (x.abs().sum(dim=-1) > 0)
-                counts = valid.sum(dim=1)  # [E]
-
-            _MOE_INSPECTOR.record(getattr(self, 'layer_idx', 0), counts, cap, drop)
-        # ------------------------------------------------------------------------
-
+        """Forward pass for SwiGLU expert"""
         if ctx.sharded_count > 1:
             raise NotImplementedError("Sharding not supported in this expert")
 
@@ -380,8 +301,7 @@ class MoETransformerBlock(nn.Module):
                 'module': SwiGLUExpert,
                 'num_experts_per_device': config.num_experts,
                 'hidden_size_per_expert': config.expert_hidden_dim,
-                'model_dim': config.hidden_dim,
-                'layer_idx': layer_idx,  # Pass layer index for tracking
+                'model_dim': config.hidden_dim
             },
             model_dim=config.hidden_dim,
             scan_expert_func=lambda name, param: setattr(param, 'skip_allreduce', True),
@@ -390,50 +310,6 @@ class MoETransformerBlock(nn.Module):
 
         # Dropout for residual connections
         self.dropout = nn.Dropout(config.dropout_rate)
-
-        # Initialize MoE inspector
-        _MOE_INSPECTOR.init_if_needed(config.num_layers, config.num_experts)
-
-        # Attach gate hook for pre-capacity statistics
-        self._attach_gate_hook(layer_idx)
-
-    def _attach_gate_hook(self, layer_idx):
-        """Attach hook to gate module for pre-capacity routing statistics"""
-        # Try to find the internal gate submodule
-        gate_mod = None
-        for name, mod in self.moe_layer.named_modules():
-            cname = mod.__class__.__name__.lower()
-            if 'gate' in name.lower() or cname.endswith('gate'):
-                gate_mod = mod
-                break
-
-        if gate_mod is None:
-            return  # Gate module not found in this Tutel version
-
-        def gate_hook(mod, inputs, output):
-            """Hook to capture gate outputs (indices/scores)"""
-            if not _MOE_INSPECTOR.enabled:
-                return
-
-            # Different Tutel versions return different outputs
-            tensors = []
-            if isinstance(output, (tuple, list)):
-                tensors = [t for t in output if torch.is_tensor(t)]
-            elif torch.is_tensor(output):
-                tensors = [output]
-
-            # Look for [tokens, k] integer tensor = expert indices
-            for t in tensors:
-                if t.dtype in (torch.int32, torch.int64) and t.dim() == 2:
-                    idx = t  # [tokens, k]
-                    num_exp = _MOE_INSPECTOR.num_experts or idx.max().item() + 1
-                    # Count pre-capacity routing decisions
-                    counts = torch.bincount(idx.reshape(-1), minlength=num_exp)
-                    # Store as "capacity" to distinguish from post-capacity "tokens"
-                    _MOE_INSPECTOR.record(layer_idx, torch.zeros_like(counts), capacity=counts)
-                    break
-
-        gate_mod.register_forward_hook(gate_hook)
 
     def forward(
         self,

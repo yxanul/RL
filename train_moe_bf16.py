@@ -6,6 +6,7 @@ Optimized for modern GPUs (A100, H100, RTX 4090, etc.)
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 import argparse
@@ -19,7 +20,7 @@ import wandb
 
 from tutel import system, net
 from tutel import moe as tutel_moe
-from moe_model import ExperimentalMoEModel, MoEConfig
+from moe_model import ExperimentalMoEModel, MoEConfig, moe_stats_enable, moe_stats_drain
 from dataset import OptimizedDataLoader
 
 
@@ -216,30 +217,74 @@ def get_gpu_memory_info():
     }
 
 
-def extract_moe_metrics(model):
-    """Extract MoE-specific metrics for monitoring"""
+def extract_moe_metrics(model, outputs=None):
+    """Extract MoE-specific metrics for monitoring
+
+    Since Tutel doesn't expose detailed routing statistics by default,
+    we extract what we can from auxiliary losses and gate parameters.
+    """
     metrics = {}
 
-    # Find MoE layers and extract routing statistics
+    # Track auxiliary losses from each layer
+    aux_losses = []
+    num_moe_layers = 0
+
+    # Find MoE layers and extract available statistics
     for i, layer in enumerate(model.layers):
-        if hasattr(layer, 'ffn') and hasattr(layer.ffn, '_moe_layer'):
-            moe_layer = layer.ffn._moe_layer
+        if hasattr(layer, 'moe_layer'):
+            moe_layer = layer.moe_layer
+            num_moe_layers += 1
 
-            # Get routing statistics if available
-            if hasattr(moe_layer, 'get_balance_loss'):
-                # Tutel exposes balance loss which indicates expert utilization
-                balance_loss = moe_layer.get_balance_loss()
-                if balance_loss is not None:
-                    metrics[f'layer_{i}/balance_loss'] = balance_loss.item()
+            # Get auxiliary loss (load balancing loss)
+            if hasattr(moe_layer, 'l_aux') and moe_layer.l_aux is not None:
+                aux_loss_val = moe_layer.l_aux.item() if hasattr(moe_layer.l_aux, 'item') else float(moe_layer.l_aux)
+                metrics[f'layer_{i}/aux_loss'] = aux_loss_val
+                aux_losses.append(aux_loss_val)
 
-            # Try to get gate statistics
-            if hasattr(moe_layer, 'gates') or hasattr(moe_layer, 'gate'):
-                gate = getattr(moe_layer, 'gates', getattr(moe_layer, 'gate', None))
-                if gate is not None and hasattr(gate, 'weight'):
-                    # Gate weight statistics
-                    gate_weights = gate.weight.data
-                    metrics[f'layer_{i}/gate_weight_mean'] = gate_weights.mean().item()
-                    metrics[f'layer_{i}/gate_weight_std'] = gate_weights.std().item()
+            # Try to get gate weight statistics (routing parameters)
+            if hasattr(moe_layer, 'gates'):
+                gates = moe_layer.gates
+                if gates is not None:
+                    # Gate linear layer exists
+                    if hasattr(gates, 'weight'):
+                        gate_weights = gates.weight.data
+                        metrics[f'layer_{i}/gate_weight_mean'] = gate_weights.mean().item()
+                        metrics[f'layer_{i}/gate_weight_std'] = gate_weights.std().item()
+                        metrics[f'layer_{i}/gate_weight_norm'] = gate_weights.norm().item()
+
+            # Check for any exposed routing scores or counts
+            if hasattr(moe_layer, 'gates_s'):
+                # Sometimes Tutel stores softmax scores here
+                gates_s = moe_layer.gates_s
+                if gates_s is not None and gates_s.numel() > 0:
+                    # Calculate entropy of routing decisions
+                    routing_probs = F.softmax(gates_s, dim=-1)
+                    entropy = -(routing_probs * (routing_probs + 1e-10).log()).sum(dim=-1).mean()
+                    metrics[f'layer_{i}/routing_entropy'] = entropy.item()
+
+            # Check for load balancing statistics if available
+            if hasattr(moe_layer, 'expert_count'):
+                expert_count = moe_layer.expert_count
+                if expert_count is not None:
+                    # Normalize to get load distribution
+                    total_count = expert_count.sum()
+                    if total_count > 0:
+                        expert_load = expert_count.float() / total_count
+                        metrics[f'layer_{i}/load_balance_variance'] = expert_load.var().item()
+                        metrics[f'layer_{i}/max_expert_load'] = expert_load.max().item()
+                        metrics[f'layer_{i}/min_expert_load'] = expert_load.min().item()
+
+    # Calculate overall metrics
+    if aux_losses:
+        metrics['overall/mean_aux_loss'] = sum(aux_losses) / len(aux_losses)
+        metrics['overall/max_aux_loss'] = max(aux_losses)
+        metrics['overall/min_aux_loss'] = min(aux_losses)
+
+    # Add the total auxiliary loss from model outputs if available
+    if outputs and 'aux_loss' in outputs:
+        metrics['overall/total_aux_loss'] = outputs['aux_loss'].item() if hasattr(outputs['aux_loss'], 'item') else float(outputs['aux_loss'])
+
+    metrics['overall/num_moe_layers'] = num_moe_layers
 
     return metrics
 
@@ -277,7 +322,7 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
         loss = loss / args.gradient_accumulation_steps
 
     # Extract MoE metrics before backward pass
-    moe_metrics = extract_moe_metrics(model)
+    moe_metrics = extract_moe_metrics(model, outputs)
 
     # Backward pass
     if args.precision == 'fp16':
@@ -618,6 +663,11 @@ def main():
                 pbar.set_postfix(pbar_dict)
                 pbar.update(1)
 
+                # Enable MoE tracking every 50 steps for detailed routing info
+                capture_moe_routing = (global_step % 50 == 0)
+                if capture_moe_routing:
+                    moe_stats_enable(True)
+
                 # Log to W&B instead of terminal
                 if args.use_wandb and global_step % 10 == 0:  # Log to W&B every 10 steps
                     wandb_metrics = {
@@ -655,12 +705,60 @@ def main():
                                 wandb_metrics['gpu/peak_tflops'] = peak
                                 break
 
+                    # Add detailed routing stats if we captured them
+                    if capture_moe_routing:
+                        layer_stats = moe_stats_drain(reset=True)
+                        if layer_stats:
+                            for li, st in enumerate(layer_stats):
+                                tok = st["tokens"].numpy()
+                                total = tok.sum()
+                                if total > 0:
+                                    # Per-expert token counts
+                                    for expert_id in range(len(tok)):
+                                        wandb_metrics[f'routing/layer_{li}/expert_{expert_id}_tokens'] = int(tok[expert_id])
+
+                                    # Load distribution metrics
+                                    load_pct = (tok / max(total, 1e-9)) * 100.0
+                                    wandb_metrics[f'routing/layer_{li}/load_std'] = float(load_pct.std())
+                                    wandb_metrics[f'routing/layer_{li}/load_cv'] = float(load_pct.std() / (load_pct.mean() + 1e-9))
+                                    wandb_metrics[f'routing/layer_{li}/max_load'] = float(load_pct.max())
+                                    wandb_metrics[f'routing/layer_{li}/min_load'] = float(load_pct.min())
+
+                                    # Find dead experts (< 1% of traffic)
+                                    dead_experts = (load_pct < 1.0).sum()
+                                    wandb_metrics[f'routing/layer_{li}/dead_experts'] = int(dead_experts)
+
+                                    # Find dominant experts (> 20% of traffic)
+                                    dominant_experts = (load_pct > 20.0).sum()
+                                    wandb_metrics[f'routing/layer_{li}/dominant_experts'] = int(dominant_experts)
+
+                        moe_stats_enable(False)  # Disable until next capture
+
                     wandb.log(wandb_metrics, step=global_step)
 
                 # Minimal terminal logging (only every 100 steps)
                 if global_step % 100 == 0:
                     # Minimal console output
                     print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | Tokens/s: {tokens_per_sec:.0f} | TFLOPS: {avg_tflops:.1f}")
+
+                    # If we have routing stats, print a summary
+                    if capture_moe_routing:
+                        layer_stats = moe_stats_drain(reset=False)  # Don't reset, already drained above
+                        if layer_stats:
+                            print("\nMoE Routing Summary (tokens per expert):")
+                            for li, st in enumerate(layer_stats):
+                                tok = st["tokens"].numpy()
+                                total = tok.sum()
+                                if total == 0:
+                                    continue
+                                load_pct = (tok / max(total, 1e-9)) * 100.0
+                                cv = load_pct.std() / (load_pct.mean() + 1e-9)
+                                top3 = tok.argsort()[-3:][::-1]
+                                bot3 = tok.argsort()[:3]
+                                dead = (load_pct < 1.0).sum()
+                                print(f"  L{li:02d} | CV: {cv:.3f} | Dead: {dead} | Top-3: {list(zip(top3, load_pct[top3].round(1)))} | Bot-3: {list(zip(bot3, load_pct[bot3].round(1)))}")
+                            print()
+
                     last_log_time = current_time
 
     pbar.close()

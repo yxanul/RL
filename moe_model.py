@@ -315,12 +315,26 @@ class SwiGLUExpert(nn.Module):
         """Forward pass for SwiGLU expert with token tracking"""
         # --- Track tokens actually processed per expert ----------------------
         if _MOE_INSPECTOR.enabled:
+            # Debug: Print ctx attributes on first call
+            layer_idx = getattr(self, 'layer_idx', 0)
+            if layer_idx == 0 and not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"\n[DEBUG] Tutel ctx attributes: {list(vars(ctx).keys())}")
+                for attr in vars(ctx):
+                    val = getattr(ctx, attr)
+                    if torch.is_tensor(val):
+                        print(f"  {attr}: tensor with shape {val.shape}, dtype {val.dtype}")
+                    else:
+                        print(f"  {attr}: {type(val).__name__} = {val}")
+
             # Prefer ctx-provided counts if available (names vary by Tutel version)
             counts = None
             cap = getattr(ctx, 'expert_capacity', None)
             drop = getattr(ctx, 'dropped_per_expert', None)
 
-            for candidate in ('tokens_per_expert', 'exp_counts', 'expert_tokens', 'counts'):
+            # Check more possible field names
+            for candidate in ('tokens_per_expert', 'exp_counts', 'expert_tokens', 'counts',
+                            'expert_count', 'indices', 'locations', 'bins'):
                 if hasattr(ctx, candidate):
                     val = getattr(ctx, candidate)
                     if torch.is_tensor(val):
@@ -328,12 +342,13 @@ class SwiGLUExpert(nn.Module):
                         break
 
             if counts is None:
-                # Fallback: treat all-zero rows as padding
-                # x: [E, T, D] -> valid token if any nonzero across D
-                valid = (x.abs().sum(dim=-1) > 0)
+                # Fallback: count non-padding tokens
+                # x: [E, T, D] -> valid token if row has any nonzero
+                # But be careful - sometimes x is already normalized/small values
+                valid = (x.abs().sum(dim=-1) > 1e-10)
                 counts = valid.sum(dim=1)  # [E]
 
-            _MOE_INSPECTOR.record(getattr(self, 'layer_idx', 0), counts, cap, drop)
+            _MOE_INSPECTOR.record(layer_idx, counts, cap, drop)
         # ------------------------------------------------------------------------
 
         if ctx.sharded_count > 1:

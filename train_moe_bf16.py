@@ -574,6 +574,11 @@ def main():
         if global_step >= args.max_steps:
             break
 
+        # Enable MoE tracking every 50 steps (before forward pass!)
+        capture_moe_routing = ((batch_idx + 1) % args.gradient_accumulation_steps == 0 and
+                              (global_step + 1) % 50 == 0)
+        moe_stats_enable(capture_moe_routing)
+
         # Training step
         loss, aux_loss, grad_norm, step_time, moe_metrics = train_step(
             model, batch, optimizer, scaler, parallel_env, args
@@ -584,6 +589,10 @@ def main():
         aux_loss_window.append(aux_loss)
         grad_norm_window.append(grad_norm)
         step_times.append(step_time)
+
+        # Disable MoE tracking after capture
+        if capture_moe_routing:
+            moe_stats_enable(False)
 
         # Gradient accumulation
         if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -663,10 +672,8 @@ def main():
                 pbar.set_postfix(pbar_dict)
                 pbar.update(1)
 
-                # Enable MoE tracking every 50 steps for detailed routing info
-                capture_moe_routing = (global_step % 50 == 0)
-                if capture_moe_routing:
-                    moe_stats_enable(True)
+                # Check if we captured routing stats this step
+                check_moe_routing = (global_step % 50 == 0)
 
                 # Log to W&B instead of terminal
                 if args.use_wandb and global_step % 10 == 0:  # Log to W&B every 10 steps
@@ -706,7 +713,7 @@ def main():
                                 break
 
                     # Add detailed routing stats if we captured them
-                    if capture_moe_routing:
+                    if check_moe_routing and capture_moe_routing:
                         layer_stats = moe_stats_drain(reset=True)
                         if layer_stats:
                             for li, st in enumerate(layer_stats):
@@ -732,8 +739,6 @@ def main():
                                     dominant_experts = (load_pct > 20.0).sum()
                                     wandb_metrics[f'routing/layer_{li}/dominant_experts'] = int(dominant_experts)
 
-                        moe_stats_enable(False)  # Disable until next capture
-
                     wandb.log(wandb_metrics, step=global_step)
 
                 # Minimal terminal logging (only every 100 steps)
@@ -743,8 +748,13 @@ def main():
 
                     # If we have routing stats, print a summary
                     if capture_moe_routing:
-                        layer_stats = moe_stats_drain(reset=False)  # Don't reset, already drained above
-                        if layer_stats:
+                        # Get stats if not already drained for W&B
+                        if not args.use_wandb or global_step % 10 != 0:
+                            layer_stats = moe_stats_drain(reset=True)
+                        else:
+                            layer_stats = moe_stats_drain(reset=False)  # Already drained for W&B
+
+                        if layer_stats and any(st["tokens"].sum() > 0 for st in layer_stats):
                             print("\nMoE Routing Summary (tokens per expert):")
                             for li, st in enumerate(layer_stats):
                                 tok = st["tokens"].numpy()

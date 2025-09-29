@@ -91,8 +91,9 @@ class MoEConfig:
     rms_norm_eps: float = 1e-6
     dropout_rate: float = 0.1
 
-    # Capacity factor for load balancing
+    # MoE-specific training parameters
     capacity_factor: float = 1.25
+    aux_loss_weight: float = 0.005  # Load balancing loss weight (lower = more specialization)
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -576,9 +577,11 @@ class ExperimentalMoEModel(nn.Module):
             )
 
             # Add auxiliary loss only during training (for load balancing)
+            # Lower weight (0.005) allows more specialization while preventing collapse
+            # Original 0.01 was too high, causing uniform routing and weak specialization
             should_use_aux = use_aux_loss if use_aux_loss is not None else self.training
             if should_use_aux:
-                loss = loss + 0.01 * total_aux_loss  # Small weight for aux loss
+                loss = loss + self.config.aux_loss_weight * total_aux_loss
 
         return {
             'loss': loss,

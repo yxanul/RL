@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 import argparse
 from tqdm import tqdm
 import time
@@ -42,6 +43,8 @@ def setup_wandb(args, model_config, parallel_env):
                     "vocab_size": model_config.vocab_size,
                     "expert_hidden_dim": model_config.expert_hidden_dim,
                     "num_key_value_heads": model_config.num_key_value_heads,
+                    "aux_loss_weight": model_config.aux_loss_weight,
+                    "capacity_factor": model_config.capacity_factor,
                 },
                 # Training config
                 "training": {
@@ -354,7 +357,7 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
 
     # Mixed precision forward pass
     if autocast_dtype:
-        with autocast(enabled=True, dtype=autocast_dtype):
+        with autocast('cuda', enabled=True, dtype=autocast_dtype):
             outputs = model(input_ids, None, labels)
             loss = outputs['loss']
             aux_loss = outputs['aux_loss']
@@ -418,7 +421,7 @@ def evaluate(model, dataloader, device, num_eval_steps=50, precision='bf16'):
         # Use autocast for consistency with training
         # Note: use_aux_loss=False to get clean validation loss without load balancing penalty
         if autocast_dtype:
-            with autocast(enabled=True, dtype=autocast_dtype):
+            with autocast('cuda', enabled=True, dtype=autocast_dtype):
                 outputs = model(input_ids, None, labels, use_aux_loss=False)
                 loss = outputs['loss']
         else:
@@ -459,10 +462,11 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
     parser.add_argument('--expert_lr_scale', type=float, default=1.0, help='LR scale for expert parameters')
     parser.add_argument('--router_lr_scale', type=float, default=1.0, help='LR scale for router/gate parameters')
+    parser.add_argument('--aux_loss_weight', type=float, default=0.005, help='MoE auxiliary loss weight (lower = more specialization)')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='Warmup steps')
     parser.add_argument('--max_steps', type=int, default=10000, help='Maximum training steps')
-    parser.add_argument('--eval_steps', type=int, default=500, help='Evaluation interval')
+    parser.add_argument('--eval_steps', type=int, default=250, help='Evaluation interval')
     parser.add_argument('--eval_batches', type=int, default=50, help='Batches per eval pass')
     parser.add_argument('--save_steps', type=int, default=1000, help='Checkpoint save interval')
     parser.add_argument('--max_length', type=int, default=2048, help='Maximum sequence length')
@@ -526,7 +530,8 @@ def main():
         num_layers=args.num_layers,
         num_experts=args.num_experts,
         num_experts_per_token=args.num_experts_per_token,
-        max_seq_length=args.max_length
+        max_seq_length=args.max_length,
+        aux_loss_weight=args.aux_loss_weight
     )
 
     # Create model

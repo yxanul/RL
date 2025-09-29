@@ -305,18 +305,9 @@ class SwiGLUExpert(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize weights with standard transformer initialization.
-
-        Note: std=0.02 is commonly used for dense transformers.
-        For sparse MoE (16 experts, 2 active), you might consider:
-        - Keeping std=0.02 but scaling expert LR (recommended, more stable)
-        - Increasing std to 0.03-0.04 for faster early learning (more aggressive)
-        - Using fan-in/fan-out scaling: std = sqrt(2 / (model_dim + hidden_dim))
-
-        Current choice: std=0.02 (conservative, proven stable)
-        """
+        """Initialize weights"""
         with torch.no_grad():
-            # Standard initialization for stability
+            # Small initialization for stability
             nn.init.normal_(self.W_gate_up, mean=0.0, std=0.02)
             nn.init.normal_(self.W_down, mean=0.0, std=0.02)
 
@@ -543,8 +534,7 @@ class ExperimentalMoEModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_aux_loss: bool = None  # If None, uses self.training
+        labels: Optional[torch.Tensor] = None
     ) -> dict:
         batch_size, seq_len = input_ids.shape
 
@@ -575,10 +565,8 @@ class ExperimentalMoEModel(nn.Module):
                 ignore_index=-100
             )
 
-            # Add auxiliary loss only during training (for load balancing)
-            should_use_aux = use_aux_loss if use_aux_loss is not None else self.training
-            if should_use_aux:
-                loss = loss + 0.01 * total_aux_loss  # Small weight for aux loss
+            # Always add auxiliary loss for load balancing (as tensor operation)
+            loss = loss + 0.01 * total_aux_loss  # Small weight for aux loss
 
         return {
             'loss': loss,

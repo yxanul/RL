@@ -21,15 +21,13 @@ class StreamingTextDataset(IterableDataset):
         tokenizer_name: str = "mistralai/Mistral-7B-Instruct-v0.3",  # Vocab size: 32768
         max_length: int = 2048,
         buffer_size: int = 10000,  # Buffer for shuffling
-        seed: int = 42,
-        skip_first: int = 0  # Optional: skip first N samples (for validation separation)
+        seed: int = 42
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.max_length = max_length
         self.buffer_size = buffer_size
         self.seed = seed
-        self.skip_first = skip_first
         
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -61,32 +59,23 @@ class StreamingTextDataset(IterableDataset):
         
         # FIXED: Use the pre-initialized dataset instead of creating new ones
         # This avoids hitting HuggingFace rate limits (1000 requests/5min)
-
-        # Apply skip_first if specified (for validation set separation)
-        dataset_shard = self._base_dataset
-        if self.skip_first > 0:
-            dataset_shard = dataset_shard.skip(self.skip_first)
-
-        # Shuffle BEFORE sharding for better randomness
-        dataset_shard = dataset_shard.shuffle(seed=self.seed + worker_id, buffer_size=self.buffer_size)
-
-        # Proper worker sharding: each worker takes every num_workers-th item
-        # Worker 0: items 0, num_workers, 2*num_workers, ...
-        # Worker 1: items 1, num_workers+1, 2*num_workers+1, ...
         if num_workers > 1:
-            # This is the CORRECT way to shard - no skip(), use take_every()
-            # Unfortunately HF datasets doesn't have take_every, so we do manual filtering
-            pass  # Manual filtering below is correct
+            # For multiple workers, use skip for efficient sharding
+            dataset_shard = self._base_dataset.skip(worker_id)
+        else:
+            dataset_shard = self._base_dataset
 
+        # Shuffle with worker-specific seed
+        dataset_shard = dataset_shard.shuffle(seed=self.seed + worker_id, buffer_size=self.buffer_size)
         dataset_iter = iter(dataset_shard)
-
+        
         # Process items with stride equal to number of workers
         token_buffer = []
         items_processed = 0
 
         for item in dataset_iter:
-            # Worker sharding: each worker processes every num_workers-th item
-            if num_workers > 1 and items_processed % num_workers != worker_id:
+            # Only process every num_workers-th item for this worker
+            if num_workers > 1 and items_processed % num_workers != 0:
                 items_processed += 1
                 continue
             items_processed += 1
@@ -102,11 +91,7 @@ class StreamingTextDataset(IterableDataset):
                     padding=False,
                     return_attention_mask=False,
                 )['input_ids']
-
-                # Add EOS token to mark document boundary
-                # This prevents training on artificial cross-document transitions
-                tokens.append(self.tokenizer.eos_token_id)
-
+                
                 token_buffer.extend(tokens)
                 
                 # Yield complete chunks
@@ -174,13 +159,9 @@ class OptimizedDataLoader:
         persistent_workers: bool = True,
         force_cpu: bool = False,  # Force CPU mode for testing
         verbose: bool = False,  # Enable detailed logging
-        is_validation: bool = False,  # Create validation dataloader with different seed
-        validation_seed: int = 999,  # Separate seed for validation
-        validation_skip: int = 50000,  # Skip first N samples for validation
     ):
         self.verbose = verbose
         self.force_cpu = force_cpu
-        self.is_validation = is_validation
 
         # Detect environment
         self.platform = platform.system()
@@ -205,18 +186,12 @@ class OptimizedDataLoader:
         self.device = torch.device('cuda' if self.has_cuda else 'cpu')
 
         if self.verbose:
-            self._print_config(is_validation)
-
-        # Use different seeds and optional skip for validation
-        dataset_seed = validation_seed if is_validation else 42
-        dataset_skip = validation_skip if is_validation else 0
+            self._print_config()
 
         self.dataset = StreamingTextDataset(
             dataset_name=dataset_name,
             dataset_config=dataset_config,
             max_length=max_length,
-            seed=dataset_seed,
-            skip_first=dataset_skip,
         )
 
         # Configure DataLoader with environment-specific optimizations
@@ -238,10 +213,10 @@ class OptimizedDataLoader:
         # Pre-warm the dataloader
         self._iterator = None
 
-    def _print_config(self, is_validation=False):
+    def _print_config(self):
         """Print detailed configuration for debugging."""
         print("\n" + "="*60)
-        print(f"DataLoader Configuration ({'VALIDATION' if is_validation else 'TRAINING'})")
+        print("DataLoader Configuration")
         print("="*60)
         print(f"Platform: {self.platform}")
         print(f"CUDA Available: {self.has_cuda}")

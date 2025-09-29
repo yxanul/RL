@@ -160,6 +160,43 @@ def compute_gradient_norm(model):
     return total_norm
 
 
+def compute_model_tflops(batch_size, seq_len, config, time_elapsed, is_training=True):
+    """Compute TFLOPS for the model - corrected calculation"""
+    # Reference: https://arxiv.org/pdf/2104.04473.pdf (Efficient Large-Scale Language Model Training)
+    # For each transformer layer:
+    # - Attention: 2 * batch * seq_len * seq_len * hidden_dim (for QKV projections)
+    # - Attention computation: 2 * batch * num_heads * seq_len * seq_len * (hidden_dim/num_heads)
+    # - FFN: 8 * batch * seq_len * hidden_dim * ffn_dim (two linear layers)
+
+    # Simplified calculation for transformer blocks
+    # Attention block (including QKV, attention, output projection)
+    attn_flops_per_layer = 2 * batch_size * seq_len * (3 * config.hidden_dim * config.hidden_dim +  # QKV
+                                                        2 * seq_len * config.hidden_dim +  # Attention
+                                                        config.hidden_dim * config.hidden_dim)  # Output proj
+
+    # MoE FFN (only active experts count)
+    # For SwiGLU: 3 matrices (gate, up, down) so it's 3x the standard FFN
+    active_experts = config.num_experts_per_token
+    ffn_flops_per_layer = 3 * 2 * batch_size * seq_len * config.hidden_dim * config.expert_hidden_dim * active_experts
+
+    # Gate computation for routing
+    gate_flops_per_layer = 2 * batch_size * seq_len * config.hidden_dim * config.num_experts
+
+    # Total per layer
+    flops_per_layer = attn_flops_per_layer + ffn_flops_per_layer + gate_flops_per_layer
+
+    # Total for all layers
+    total_flops = flops_per_layer * config.num_layers
+
+    # Training multiplier (forward + backward + gradient computation)
+    if is_training:
+        total_flops *= 3
+
+    # Convert to TFLOPS/s
+    tflops = total_flops / (time_elapsed * 1e12)
+
+    return tflops
+
 
 def checkpoint_path(output_dir, step):
     """Generate checkpoint path for a given step"""
@@ -394,8 +431,8 @@ def train_step(model, batch, optimizer, scaler, parallel_env, args):
 
 @torch.no_grad()
 def evaluate(model, dataloader, device, num_eval_steps=50, precision='bf16'):
-    """Evaluate model on validation data: average CE over tokens; PPL derived from that.
-    dataloader should be a separate validation dataloader with different seed from training."""
+    """Evaluate: average CE over tokens; PPL derived from that.
+    NOTE: we evaluate on the *train* split stream as requested."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -416,13 +453,12 @@ def evaluate(model, dataloader, device, num_eval_steps=50, precision='bf16'):
         labels = batch['labels']
 
         # Use autocast for consistency with training
-        # Note: use_aux_loss=False to get clean validation loss without load balancing penalty
         if autocast_dtype:
             with autocast(enabled=True, dtype=autocast_dtype):
-                outputs = model(input_ids, None, labels, use_aux_loss=False)
+                outputs = model(input_ids, None, labels)
                 loss = outputs['loss']
         else:
-            outputs = model(input_ids, None, labels, use_aux_loss=False)
+            outputs = model(input_ids, None, labels)
             loss = outputs['loss']
 
         # Count actual tokens (sequence_length - 1 per example)
@@ -457,8 +493,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size per GPU')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Gradient accumulation steps')
     parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
-    parser.add_argument('--expert_lr_scale', type=float, default=1.0, help='LR scale for expert parameters')
-    parser.add_argument('--router_lr_scale', type=float, default=1.0, help='LR scale for router/gate parameters')
+    parser.add_argument('--expert_lr_scale', type=float, default=1.0, help='LR scale for expert parameters')\n    parser.add_argument('--router_lr_scale', type=float, default=1.0, help='LR scale for router/gate parameters')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='Warmup steps')
     parser.add_argument('--max_steps', type=int, default=10000, help='Maximum training steps')
@@ -556,33 +591,17 @@ def main():
         if args.precision == 'bf16':
             print("Using native BF16 (no GradScaler needed)")
 
-    # Create separate train and validation data loaders
+    # Create data loader
     if parallel_env.global_rank == 0:
-        print("\nInitializing training dataset...")
+        print("\nInitializing dataset...")
 
-    train_dataloader = OptimizedDataLoader(
+    dataloader = OptimizedDataLoader(
         dataset_name=args.dataset_name,
         batch_size=args.batch_size,
         max_length=args.max_length,
         num_workers=args.num_workers,
         force_cpu=not torch.cuda.is_available(),
-        verbose=(parallel_env.global_rank == 0),
-        is_validation=False  # Training loader
-    )
-
-    if parallel_env.global_rank == 0:
-        print("Initializing validation dataset...")
-
-    val_dataloader = OptimizedDataLoader(
-        dataset_name=args.dataset_name,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        num_workers=args.num_workers,
-        force_cpu=not torch.cuda.is_available(),
-        verbose=(parallel_env.global_rank == 0),
-        is_validation=True,  # Validation loader with different seed
-        validation_seed=999,
-        validation_skip=50000
+        verbose=(parallel_env.global_rank == 0)
     )
 
     # Training info
@@ -595,9 +614,30 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Total parameters: {total_params / 1e6:.2f}M")
 
+        # Calculate theoretical peak TFLOPS for the GPU
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name()
+            # Peak TFLOPS for BF16/FP16 Tensor Cores (not FP32!)
+            gpu_peak_tflops = {
+                'A100': 312,      # A100 80GB - BF16 tensor cores
+                'A6000': 155,     # RTX A6000 - FP16 tensor cores
+                'V100': 125,      # V100 - FP16 tensor cores
+                '4090': 330,      # RTX 4090 - ~330 TFLOPS BF16 tensor cores (not 82.6 FP32!)
+                '4080': 195,      # RTX 4080 - ~195 TFLOPS BF16 tensor cores
+                '3090': 142,      # RTX 3090 - FP16 tensor cores (no BF16 support)
+                'H100': 989,      # H100 80GB - BF16 tensor cores
+                'A40': 150,       # A40 - FP16 tensor cores
+                'L40': 362,       # L40 - FP16 tensor cores
+            }
+
+            peak_tflops = 100  # Default estimate
+            for gpu_key, tflops_val in gpu_peak_tflops.items():
+                if gpu_key in gpu_name:
+                    peak_tflops = tflops_val
+                    break
+
             print(f"GPU: {gpu_name}")
+            print(f"Theoretical Peak TFLOPS: ~{peak_tflops}")
 
         print("="*60 + "\n")
 
@@ -605,10 +645,14 @@ def main():
     loss_window = deque(maxlen=100)
     aux_loss_window = deque(maxlen=100)
     grad_norm_window = deque(maxlen=100)
+    tflops_window = deque(maxlen=50)
     tokens_processed = 0
     training_start_time = time.time()
     last_log_time = time.time()
     step_times = deque(maxlen=100)
+
+    # Model configuration for TFLOPS calculation
+    model_config = config
 
     # Optional profiling
     profiler = None
@@ -640,7 +684,7 @@ def main():
 
     pbar = tqdm(total=args.max_steps, desc="Training", disable=(parallel_env.global_rank != 0), unit="step", initial=global_step)
 
-    for batch_idx, batch in enumerate(train_dataloader):
+    for batch_idx, batch in enumerate(dataloader):
         if global_step >= args.max_steps:
             break
 
@@ -687,7 +731,7 @@ def main():
             # Evaluation
             if global_step % args.eval_steps == 0 and parallel_env.global_rank == 0:
                 eval_loss, eval_ppl = evaluate(
-                    model, val_dataloader, device,
+                    model, dataloader, device,
                     num_eval_steps=args.eval_batches,
                     precision=args.precision
                 )
@@ -729,6 +773,28 @@ def main():
             avg_aux_loss = np.mean(aux_loss_window) if aux_loss_window else aux_loss
             avg_grad_norm = np.mean(grad_norm_window) if grad_norm_window else grad_norm
             perplexity = np.exp(min(avg_loss, 20))  # Cap to avoid overflow
+
+            # Calculate TFLOPS (using actual step time, not per-sample time)
+            # Note: step_time is for single batch, but we accumulate gradients
+            # So effective computation is batch_size * gradient_accumulation_steps
+            effective_batch = args.batch_size * args.gradient_accumulation_steps
+
+            # Use the average time per gradient accumulation cycle
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 and step_times:
+                # Time for full gradient accumulation cycle
+                cycle_time = sum(list(step_times)[-args.gradient_accumulation_steps:])
+
+                tflops = compute_model_tflops(
+                    batch_size=effective_batch,
+                    seq_len=args.max_length,
+                    config=model_config,
+                    time_elapsed=cycle_time,
+                    is_training=True
+                )
+                tflops_window.append(tflops)
+                avg_tflops = np.mean(tflops_window) if tflops_window else tflops
+            else:
+                avg_tflops = np.mean(tflops_window) if tflops_window else 0
 
             # Calculate tokens/sec
             current_time = time.time()
@@ -772,6 +838,7 @@ def main():
 
                         # Performance metrics
                         'performance/tokens_per_sec': tokens_per_sec,
+                        'performance/tflops': avg_tflops,
                         'performance/step_time_ms': np.mean(step_times) * 1000 if step_times else 0,
                         'performance/tokens_processed': tokens_processed,
 
@@ -785,18 +852,21 @@ def main():
                     for key, value in moe_metrics.items():
                         wandb_metrics[f'moe/{key}'] = value
 
+                    # Calculate GPU utilization if possible
+                    if torch.cuda.is_available() and avg_tflops > 0:
+                        gpu_name = torch.cuda.get_device_name()
+                        for gpu_key in ['4090', '3090', 'A100', 'V100', 'H100', 'A40', 'L40', '4080']:
+                            if gpu_key in gpu_name:
+                                peak = gpu_peak_tflops.get(gpu_key, 100)
+                                utilization = (avg_tflops / peak) * 100
+                                wandb_metrics['gpu/compute_utilization'] = utilization
+                                wandb_metrics['gpu/peak_tflops'] = peak
+                                break
+
                     # Add detailed routing stats if we captured them
                     if check_moe_routing and capture_moe_routing:
                         layer_stats = moe_stats_drain(reset=True)
                         if layer_stats:
-                            # Track overall expert utilization across all layers
-                            total_dead_experts = 0
-                            total_dominant_experts = 0
-                            total_experts_active = 0
-                            num_layers_tracked = 0
-                            avg_load_cv = []
-                            total_tokens_routed = 0
-                            total_tokens_dropped = 0
                             for li, st in enumerate(layer_stats):
                                 tok = st["tokens"].numpy()
                                 total = tok.sum()
@@ -820,14 +890,6 @@ def main():
                                     dominant_experts = (load_pct > 20.0).sum()
                                     wandb_metrics[f'routing/layer_{li}/dominant_experts'] = int(dominant_experts)
 
-                                    # Accumulate for overall metrics
-                                    total_dead_experts += int(dead_experts)
-                                    total_dominant_experts += int(dominant_experts)
-                                    total_experts_active += int((load_pct >= 1.0).sum())  # >= 1% traffic
-                                    num_layers_tracked += 1
-                                    cv = float(load_pct.std() / (load_pct.mean() + 1e-9))
-                                    avg_load_cv.append(cv)
-
                                     # --- Stability extras ---
                                     # Get capacity and dropped if available
                                     cap = st.get("capacity", np.zeros_like(tok))
@@ -835,16 +897,9 @@ def main():
 
                                     pre_capacity = cap.sum()
                                     dropped_total = drp.sum()
-
-                                    # Accumulate for overall drop rate
-                                    total_tokens_routed += int(pre_capacity)
-                                    total_tokens_dropped += int(dropped_total)
-
                                     if pre_capacity > 0:
-                                        drop_rate = float(dropped_total / pre_capacity)
-                                        wandb_metrics[f'routing/layer_{li}/drop_rate'] = drop_rate
+                                        wandb_metrics[f'routing/layer_{li}/drop_rate'] = float(dropped_total / pre_capacity)
                                         wandb_metrics[f'routing/layer_{li}/capacity_utilization'] = float(total / pre_capacity)
-                                        wandb_metrics[f'routing/layer_{li}/tokens_dropped'] = int(dropped_total)
 
                                     # Entropy & KL divergence to uniform distribution
                                     p = (tok / max(total, 1e-9)).astype(np.float64)
@@ -862,37 +917,12 @@ def main():
                                     wandb_metrics[f'routing/layer_{li}/entropy_normalized'] = norm_H
                                     wandb_metrics[f'routing/layer_{li}/kl_to_uniform'] = KL
 
-                            # Add overall expert utilization summary metrics
-                            if num_layers_tracked > 0:
-                                num_experts_per_layer = len(layer_stats[0]["tokens"])
-                                total_possible_experts = num_layers_tracked * num_experts_per_layer
-
-                                # Overall utilization percentage
-                                utilization_pct = (total_experts_active / total_possible_experts) * 100
-                                wandb_metrics['routing/overall/expert_utilization_pct'] = utilization_pct
-
-                                # Average dead/dominant experts per layer
-                                wandb_metrics['routing/overall/avg_dead_experts_per_layer'] = total_dead_experts / num_layers_tracked
-                                wandb_metrics['routing/overall/avg_dominant_experts_per_layer'] = total_dominant_experts / num_layers_tracked
-                                wandb_metrics['routing/overall/avg_active_experts_per_layer'] = total_experts_active / num_layers_tracked
-
-                                # Average load balance quality
-                                if avg_load_cv:
-                                    wandb_metrics['routing/overall/avg_load_cv'] = float(np.mean(avg_load_cv))
-
-                                # Overall token drop rate (due to capacity constraints)
-                                if total_tokens_routed > 0:
-                                    overall_drop_rate = (total_tokens_dropped / total_tokens_routed) * 100
-                                    wandb_metrics['routing/overall/drop_rate_pct'] = overall_drop_rate
-                                    wandb_metrics['routing/overall/total_tokens_dropped'] = total_tokens_dropped
-                                    wandb_metrics['routing/overall/total_tokens_routed'] = total_tokens_routed
-
                     wandb.log(wandb_metrics, step=global_step)
 
                 # Minimal terminal logging (only every 100 steps)
                 if global_step % 100 == 0:
                     # Minimal console output
-                    print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | Tokens/s: {tokens_per_sec:.0f}")
+                    print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | Tokens/s: {tokens_per_sec:.0f} | TFLOPS: {avg_tflops:.1f}")
 
                     # If we have routing stats, print a summary
                     if capture_moe_routing:
